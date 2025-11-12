@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import socket
 import sys
@@ -6,145 +7,163 @@ import sys
 
 def formata_lista_int(arg):
     """
-    Função type customizada: Converte uma string 'p1,p2,p3' em uma lista de INTEIROS [p1, p2, p3].
+    Converte string '80,443,22' em lista de inteiros [80, 443, 22].
     """
     if not arg:
-        # Se o argumento não for fornecido e não houver um 'default', retorna lista vazia.
         return []
     try:
-        # Remove espaços e converte para inteiro
-        return [int(item.strip()) for item in arg.split(',')]
+        return [int(item.strip()) for item in arg.split(',') if item.strip()]
     except ValueError:
-        # ArgumentTypeError é o padrão para erros de tipo no argparse
         raise argparse.ArgumentTypeError("Portas devem ser números inteiros separados por vírgula.")
 
-# --- 2. Função de Parsing de Argumentos ---
+# --- 2. Dicionário de Protocolos Conhecidos ---
+
+PROTOCOLOS_CONHECIDOS = {
+    21:   ("FTP",       b"HELP\r\n"),
+    22:   ("SSH",       b""),  # Banner automático ao conectar
+    23:   ("Telnet",    b"\r\n"),
+    25:   ("SMTP",      b"EHLO localhost\r\n"),
+    53:   ("DNS",       b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06google\x03com\x00\x00\x01\x00\x01"),
+    80:   ("HTTP",      b"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+    110:  ("POP3",      b"USER root\r\n"),
+    143:  ("IMAP",      b"1 CAPABILITY\r\n"),
+    443:  ("HTTPS",     b"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+    993:  ("IMAPS",     b"1 CAPABILITY\r\n"),
+    995:  ("POP3S",     b"USER root\r\n"),
+    3306: ("MySQL",     b""),  # Banner automático
+    5432: ("PostgreSQL",b""),  # Banner automático
+    8080: ("HTTP-Alt",  b"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+    3389: ("RDP",       b""),  # Banner automático
+}
+
+def detectar_protocolo(port, host):
+    """Retorna (nome_protocolo, comando_para_enviar)"""
+    if port in PROTOCOLOS_CONHECIDOS:
+        nome, cmd_template = PROTOCOLOS_CONHECIDOS[port]
+        if b"{host}" in cmd_template:
+            cmd = cmd_template.replace(b"{host}", host.encode())
+        else:
+            cmd = cmd_template
+        return nome, cmd
+    else:
+        # Fallback: tenta como HTTP
+        return "Desconhecido", b"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n".replace(b"{host}", host.encode())
+
+# --- 3. Função de Parsing de Argumentos ---
 
 def processar_argumentos_terminal():
-    """
-    Configura e analisa os argumentos de linha de comando.
-    """
     parser = argparse.ArgumentParser(
-        description='Ferramenta de varredura de portas com modo detalhado.',
-        # Eu ajustei o 'epilog' para algo mais neutro e focado em aprendizado.
-        epilog='Use a ferramenta para propósitos educacionais e em sistemas autorizados.'
+        description='Banner Grabber Avançado com detecção de protocolo.',
+        epilog='Use apenas em sistemas autorizados. Ideal para pentest educacional.'
     )
 
-    # Argumento Posicional (Host/IP - Obrigatório)
-    # Nota: Mudei de '-path' para um argumento posicional simples, que é o padrão para o IP.
-    parser.add_argument(
-        'host_ip',
-        type=str,
-        help='O endereço IP ou hostname alvo (Ex: 192.168.1.1).'
-    )
+    parser.add_argument('host_ip', type=str, help='IP ou hostname alvo (ex: 192.168.1.1)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Modo detalhado: mostra banner completo')
+    parser.add_argument('-p', '--ports', type=formata_lista_int, default=[80, 443],
+                        help='Portas para escanear (ex: 22,80,443). Padrão: 80,443')
+    parser.add_argument('-o', '--output', type=str, default=None,
+                        help='Salvar resultados em arquivo')
 
-    # Argumento -v / --verbose (Flag)
-    parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help='Ativa o modo detalhado. Mostra o status e o banner de CADA porta.'
-    )
-
-    # Argumento -p / --ports (Lista)
-    parser.add_argument(
-        '-p', '--ports',
-        type=formata_lista_int, # Usa a função customizada
-        default=[80, 443],      # Portas padrão se a flag for omitida
-        help='Lista de portas a serem verificadas, separadas por vírgula (Ex: 22,80,443). Padrão: 80,443.'
-    )
-
-    # Argumento -u / --user (Usuário)
-    parser.add_argument(
-        '-u', '--user',
-        type=str,
-        default='root',
-        help='Especifica usuário para tentativa de conexão. (Ex. ssh root@192.168.1.1).'
-        )
-
-    # Argumento -passwd / --password
-    parser.add_argument(
-    '-passwd', '--password',
-    type=str,
-    default='toor',
-    help='Especifica senha para tentativa de conexão.'
-    )
-
-    # Argumento -o / --output (Saída para arquivo)
-    parser.add_argument(
-        '-o', '--output',
-        type=str,
-        default=None,
-        help='Especifica o nome do arquivo para salvar a saída.'
-    )
-
-    # Analisa e retorna os argumentos
     return parser.parse_args()
 
-# --- 3. Função de Varredura de Portas (Lógica Principal) ---
+# --- 4. Função Principal de Varredura ---
 
-def scan_ports(host, ports, verbose):
-    """
-    Executa a varredura de portas e a lógica de captura de banner.
-    """
-    TIMEOUT = 1.0 # Timeout de 1 segundo para a conexão
+def scan_ports(host, ports, verbose, output_file=None):
+    TIMEOUT = 2.0
+    print(f"\nIniciando varredura em {host} ({len(ports)} portas)...\n")
 
-    print(f"\nIniciando varredura em {host} ({len(ports)} portas)...")
+    resultados = []
+    abertas = 0
 
-    # Variável de controle para o modo não-verbose
-    first_banner_shown = False
-
-    for port in ports:
-        # Cria um novo socket a cada iteração
+    for port in sorted(ports):
+        protocolo, comando = detectar_protocolo(port, host)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(TIMEOUT)
 
+        status = "FECHADA"
+        banner = ""
+        linha_resumo = ""
+
         try:
             s.connect((host, port))
+            status = "ABERTA"
+            abertas += 1
 
-            # --- Tentar Capturar o Banner ---
-            # Envia um HTTP GET simples para provocar a resposta (banner)
-            s.sendall(b'GET / HTTP/1.1\r\nHost: ' + host.encode() + b'\r\n\r\n')
+            # Alguns serviços enviam banner automaticamente
+            if protocolo in ["SSH", "MySQL", "PostgreSQL", "RDP"]:
+                banner = s.recv(1024).decode('utf-8', errors='ignore').strip()
+            else:
+                s.sendall(comando)
+                banner = s.recv(1024).decode('utf-8', errors='ignore').strip()
 
-            banner = s.recv(1024).decode(errors='ignore').strip()
+            primeira_linha = banner.splitlines()[0][:70] if banner else "(vazio)"
+            linha_resumo = f"Porta {port:5} | {protocolo:12} | ABERTA  | {primeira_linha}"
 
             if verbose:
-                print(f"[+] Porta {port} ABERTA")
-                print(f"    [BANNER]: {banner}\n{'-'*20}")
+                print(f"[+] Porta {port} ABERTA - {protocolo}")
+                print(f"    [BANNER]:\n{banner}\n" + "-"*50)
+            else:
+                print(linha_resumo)
 
-            elif not first_banner_shown:
-                # MODO SIMPLES: Mostra o primeiro banner encontrado e para
-                print(f"[+] Porta {port} ABERTA. Banner capturado:")
-                print(f"    {banner}\n{'-'*20}")
-                first_banner_shown = True # Marca que já foi mostrado
+            resultados.append(linha_resumo + f"\n    Banner completo: {banner}")
 
         except socket.timeout:
+            status = "FILTRADA"
             if verbose:
-                print(f"[-] Porta {port} FILTRADA (Tempo Esgotado)")
+                print(f"[-] Porta {port:5} | {protocolo:12} | FILTRADA (timeout)")
 
         except ConnectionRefusedError:
+            status = "FECHADA"
             if verbose:
-                print(f"[-] Porta {port} FECHADA (Conexão Recusada)")
+                print(f"[-] Porta {port:5} | {protocolo:12} | FECHADA")
 
         except Exception as e:
+            status = "ERRO"
             if verbose:
-                print(f"[-] Porta {port} - ERRO: {e}")
+                print(f"[!] Porta {port:5} | {protocolo:12} | ERRO: {e}")
 
         finally:
             s.close()
 
-    print("\nVarredura concluída.")
+    # --- Salvar em arquivo ---
+    if output_file:
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(f"Banner Grabber - Resultados para {host}\n")
+                f.write(f"Data: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Portas escaneadas: {len(ports)} | Portas abertas: {abertas}\n")
+                f.write("="*80 + "\n\n")
+                for r in resultados:
+                    f.write(r + "\n\n")
+            print(f"\nResultados salvos em: {output_file}")
+        except Exception as e:
+            print(f"\nErro ao salvar arquivo: {e}")
 
-# --- 4. Bloco Principal de Execução ---
+    print(f"\nVarredura concluída. {abertas} porta(s) aberta(s).")
+
+# --- 5. Bloco Principal ---
 
 def main():
-    # 1. Processa os argumentos primeiro
     args = processar_argumentos_terminal()
-
     host = args.host_ip
     ports = args.ports
     verbose = args.verbose
+    output = args.output
 
-    # 2. Executa a varredura
-    scan_ports(host, ports, verbose)
+    if not ports:
+        print("Nenhuma porta especificada. Usando padrão: 80,443")
+        ports = [80, 443]
 
-main()
+    try:
+        socket.inet_aton(host)  # Valida IP
+    except socket.error:
+        try:
+            socket.gethostbyname(host)  # Valida hostname
+        except socket.gaierror:
+            print("Erro: Host inválido ou não resolvível.")
+            sys.exit(1)
+
+    scan_ports(host, ports, verbose, output)
+
+if __name__ == "__main__":
+    main()
